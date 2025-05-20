@@ -29,26 +29,10 @@ type WebhookPayload struct {
 	} `json:"repository"`
 }
 
-type DeepseekRequest struct {
-	Messages []struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	} `json:"messages"`
-	Model string `json:"model"`
-}
-
-type DeepseekResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
-}
-
 func main() {
 	http.HandleFunc("/webhook", handleWebhook)
 	fmt.Println("Server starting on :8080...")
-	http.ListenAndServe(":8080", nil)
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
@@ -64,7 +48,6 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	case "ping":
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "Ping received")
-		return
 	case "pull_request":
 		var wp WebhookPayload
 		if err := json.Unmarshal(payload, &wp); err != nil {
@@ -85,7 +68,7 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		review, err := getAIReview(diff)
+		review, err := getAIReviewFromHF(diff)
 		if err != nil {
 			log.Printf("Error getting AI review: %v", err)
 			http.Error(w, "AI review failed", http.StatusInternalServerError)
@@ -138,17 +121,19 @@ func fetchPRDiff(diffURL string) (string, error) {
 	return string(body), err
 }
 
-func getAIReview(diff string) (string, error) {
-	prompt := fmt.Sprintf("Review the following Go code diff for errors, concurrency issues, and idiomatic practices. Provide specific suggestions for improvement:\n\n```diff\n%s\n```", diff)
-	reqBody := DeepseekRequest{
-		Messages: []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		}{
-			{Role: "user", Content: prompt},
+// ✅ Hugging Face inference with deepseek-coder
+func getAIReviewFromHF(diff string) (string, error) {
+	prompt := fmt.Sprintf(
+		"<|user|>\nReview the following Go code diff for errors, concurrency issues, and idiomatic practices. Provide specific suggestions for improvement:\n\n```diff\n%s\n```<|assistant|>",
+		diff,
+	)
+
+	reqBody := map[string]interface{}{
+		"inputs": prompt,
+		"parameters": map[string]interface{}{
+			"max_new_tokens": 512,
+			"temperature":    0.7,
 		},
-		// Updated model name to valid identifier
-		Model: "deepseek-chat",
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -156,11 +141,12 @@ func getAIReview(diff string) (string, error) {
 		return "", fmt.Errorf("marshal failed: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", "https://api.deepseek.com/v1/chat/completions", bytes.NewBuffer(jsonBody))
+	apiURL := "https://api-inference.huggingface.co/models/deepseek-ai/deepseek-coder-6.7b-instruct"
+	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return "", fmt.Errorf("create request failed: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+os.Getenv("DEEPSEEK_API_KEY"))
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("HF_API_TOKEN"))
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -169,22 +155,21 @@ func getAIReview(diff string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	// Handle non-200 responses first
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("Deepseek API error %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("Hugging Face API error %d: %s", resp.StatusCode, string(body))
 	}
 
-	var deepseekResp DeepseekResponse
-	if err := json.NewDecoder(resp.Body).Decode(&deepseekResp); err != nil {
+	var result []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", fmt.Errorf("decode failed: %w", err)
 	}
 
-	if len(deepseekResp.Choices) == 0 {
-		return "", fmt.Errorf("no response content in API answer")
+	if len(result) == 0 || result[0]["generated_text"] == nil {
+		return "", fmt.Errorf("no response content")
 	}
 
-	return deepseekResp.Choices[0].Message.Content, nil
+	return result[0]["generated_text"].(string), nil
 }
 
 func postGitHubComment(wp WebhookPayload, comment string) error {
