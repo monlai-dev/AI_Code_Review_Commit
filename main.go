@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 
@@ -79,17 +80,20 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 		diff, err := fetchPRDiff(wp.PullRequest.DiffURL)
 		if err != nil {
+			log.Printf("Error fetching diff: %v", err)
 			http.Error(w, "Failed to fetch diff", http.StatusInternalServerError)
 			return
 		}
 
 		review, err := getAIReview(diff)
 		if err != nil {
+			log.Printf("Error getting AI review: %v", err)
 			http.Error(w, "AI review failed", http.StatusInternalServerError)
 			return
 		}
 
 		if err := postGitHubComment(wp, review); err != nil {
+			log.Printf("Error posting comment: %v", err)
 			http.Error(w, "Failed to post comment", http.StatusInternalServerError)
 			return
 		}
