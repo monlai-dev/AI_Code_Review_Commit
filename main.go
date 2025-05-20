@@ -68,7 +68,7 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		review, err := getAIReviewFromHF(diff)
+		review, err := getAIReviewFromOpenAI(diff)
 		if err != nil {
 			log.Printf("Error getting AI review: %v", err)
 			http.Error(w, "AI review failed", http.StatusInternalServerError)
@@ -122,18 +122,26 @@ func fetchPRDiff(diffURL string) (string, error) {
 }
 
 // ✅ Hugging Face inference with deepseek-coder
-func getAIReviewFromHF(diff string) (string, error) {
+func getAIReviewFromOpenAI(diff string) (string, error) {
 	prompt := fmt.Sprintf(
-		"<|user|>\nReview the following Go code diff for errors, concurrency issues, and idiomatic practices. Provide specific suggestions for improvement:\n\n```diff\n%s\n```<|assistant|>",
+		"Review the following Go code diff for errors, concurrency issues, and idiomatic practices. Provide specific suggestions for improvement:\n\n```diff\n%s\n```",
 		diff,
 	)
 
 	reqBody := map[string]interface{}{
-		"inputs": prompt,
-		"parameters": map[string]interface{}{
-			"max_new_tokens": 512,
-			"temperature":    0.7,
+		"model": "gpt-3.5-turbo",
+		"messages": []map[string]string{
+			{
+				"role":    "system",
+				"content": "You are a code review assistant that provides helpful, concise feedback on code diffs.",
+			},
+			{
+				"role":    "user",
+				"content": prompt,
+			},
 		},
+		"temperature": 0.7,
+		"max_tokens":  512,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -141,12 +149,12 @@ func getAIReviewFromHF(diff string) (string, error) {
 		return "", fmt.Errorf("marshal failed: %w", err)
 	}
 
-	apiURL := "https://api-inference.huggingface.co/models/deepseek-ai/deepseek-coder-6.7b-instruct"
+	apiURL := "https://api.openai.com/v1/chat/completions"
 	req, err := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return "", fmt.Errorf("create request failed: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+os.Getenv("HF_API_TOKEN"))
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("OPENAI_API_KEY"))
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -157,19 +165,25 @@ func getAIReviewFromHF(diff string) (string, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("Hugging Face API error %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("OpenAI API error %d: %s", resp.StatusCode, string(body))
 	}
 
-	var result []map[string]interface{}
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", fmt.Errorf("decode failed: %w", err)
 	}
 
-	if len(result) == 0 || result[0]["generated_text"] == nil {
+	if len(result.Choices) == 0 {
 		return "", fmt.Errorf("no response content")
 	}
 
-	return result[0]["generated_text"].(string), nil
+	return result.Choices[0].Message.Content, nil
 }
 
 func postGitHubComment(wp WebhookPayload, comment string) error {
