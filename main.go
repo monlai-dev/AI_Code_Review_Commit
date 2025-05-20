@@ -147,7 +147,8 @@ func getAIReview(diff string) (string, error) {
 		}{
 			{Role: "user", Content: prompt},
 		},
-		Model: "deepseek-r1",
+		// Updated model name to valid identifier
+		Model: "deepseek-chat",
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -168,9 +169,10 @@ func getAIReview(diff string) (string, error) {
 	}
 	defer resp.Body.Close()
 
+	// Handle non-200 responses first
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("API status %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("Deepseek API error %d: %s", resp.StatusCode, string(body))
 	}
 
 	var deepseekResp DeepseekResponse
@@ -179,7 +181,7 @@ func getAIReview(diff string) (string, error) {
 	}
 
 	if len(deepseekResp.Choices) == 0 {
-		return "", fmt.Errorf("no choices in response")
+		return "", fmt.Errorf("no response content in API answer")
 	}
 
 	return deepseekResp.Choices[0].Message.Content, nil
