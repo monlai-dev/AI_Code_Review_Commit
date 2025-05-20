@@ -3,18 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 
-	"crypto/hmac"
-	"crypto/sha256"
 	"github.com/google/go-github/v62/github"
 )
 
-// WebhookPayload represents the GitHub webhook payload (simplified)
 type WebhookPayload struct {
 	Action      string `json:"action"`
 	PullRequest struct {
@@ -29,7 +28,6 @@ type WebhookPayload struct {
 	} `json:"repository"`
 }
 
-// DeepseekRequest represents the request to Deepseek's API
 type DeepseekRequest struct {
 	Messages []struct {
 		Role    string `json:"role"`
@@ -38,7 +36,6 @@ type DeepseekRequest struct {
 	Model string `json:"model"`
 }
 
-// DeepseekResponse represents the response from Deepseek
 type DeepseekResponse struct {
 	Choices []struct {
 		Message struct {
@@ -50,13 +47,10 @@ type DeepseekResponse struct {
 func main() {
 	http.HandleFunc("/webhook", handleWebhook)
 	fmt.Println("Server starting on :8080...")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		fmt.Printf("Server error: %v\n", err)
-	}
+	http.ListenAndServe(":8080", nil)
 }
 
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
-	// Verify webhook signature
 	secret := []byte(os.Getenv("WEBHOOK_SECRET"))
 	payload, err := verifyWebhookSignature(r, secret)
 	if err != nil {
@@ -64,50 +58,55 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse webhook payload
-	var wp WebhookPayload
-	if err := json.Unmarshal(payload, &wp); err != nil {
-		http.Error(w, "Invalid payload", http.StatusBadRequest)
+	eventType := r.Header.Get("X-GitHub-Event")
+	switch eventType {
+	case "ping":
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "Ping received")
 		return
-	}
+	case "pull_request":
+		var wp WebhookPayload
+		if err := json.Unmarshal(payload, &wp); err != nil {
+			http.Error(w, "Invalid payload", http.StatusBadRequest)
+			return
+		}
 
-	// Handle only pull_request events
-	if r.Header.Get("X-GitHub-Event") != "pull_request" || wp.Action != "opened" {
-		http.Error(w, "Ignored event", http.StatusOK)
-		return
-	}
+		if wp.Action != "opened" {
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprint(w, "Ignored non-opened action")
+			return
+		}
 
-	// Fetch the PR diff
-	diff, err := fetchPRDiff(wp.PullRequest.DiffURL)
-	if err != nil {
-		http.Error(w, "Failed to fetch diff", http.StatusInternalServerError)
-		return
-	}
+		diff, err := fetchPRDiff(wp.PullRequest.DiffURL)
+		if err != nil {
+			http.Error(w, "Failed to fetch diff", http.StatusInternalServerError)
+			return
+		}
 
-	// Send diff to Deepseek for review
-	review, err := getAIReview(diff)
-	if err != nil {
-		http.Error(w, "AI review failed", http.StatusInternalServerError)
-		return
-	}
+		review, err := getAIReview(diff)
+		if err != nil {
+			http.Error(w, "AI review failed", http.StatusInternalServerError)
+			return
+		}
 
-	// Post review comment to GitHub
-	err = postGitHubComment(wp, review)
-	if err != nil {
-		http.Error(w, "Failed to post comment", http.StatusInternalServerError)
-		return
-	}
+		if err := postGitHubComment(wp, review); err != nil {
+			http.Error(w, "Failed to post comment", http.StatusInternalServerError)
+			return
+		}
 
-	fmt.Fprint(w, "Review posted successfully")
+		fmt.Fprint(w, "Review posted successfully")
+	default:
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "Ignored event type")
+	}
 }
 
-// verifyWebhookSignature verifies the GitHub webhook signature
 func verifyWebhookSignature(r *http.Request, secret []byte) ([]byte, error) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, err
 	}
-	r.Body = io.NopCloser(bytes.NewBuffer(body)) // Restore body for later use
+	r.Body = io.NopCloser(bytes.NewBuffer(body))
 
 	sig := r.Header.Get("X-Hub-Signature-256")
 	if sig == "" {
@@ -124,7 +123,6 @@ func verifyWebhookSignature(r *http.Request, secret []byte) ([]byte, error) {
 	return body, nil
 }
 
-// fetchPRDiff fetches the PR diff from the provided URL
 func fetchPRDiff(diffURL string) (string, error) {
 	resp, err := http.Get(diffURL)
 	if err != nil {
@@ -133,13 +131,9 @@ func fetchPRDiff(diffURL string) (string, error) {
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	return string(body), nil
+	return string(body), err
 }
 
-// getAIReview sends the diff to Deepseek R1 and returns the review
 func getAIReview(diff string) (string, error) {
 	prompt := fmt.Sprintf("Review the following Go code diff for errors, concurrency issues, and idiomatic practices. Provide specific suggestions for improvement:\n\n```diff\n%s\n```", diff)
 	reqBody := DeepseekRequest{
@@ -154,53 +148,47 @@ func getAIReview(diff string) (string, error) {
 
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %v", err)
+		return "", fmt.Errorf("marshal failed: %w", err)
 	}
 
 	req, err := http.NewRequest("POST", "https://api.deepseek.com/v1/chat/completions", bytes.NewBuffer(jsonBody))
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %v", err)
+		return "", fmt.Errorf("create request failed: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+os.Getenv("DEEPSEEK_API_KEY"))
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to call Deepseek API: %v", err)
+		return "", fmt.Errorf("API call failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("Deepseek API returned %d: %s", resp.StatusCode, string(body))
+		return "", fmt.Errorf("API status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var deepseekResp DeepseekResponse
 	if err := json.NewDecoder(resp.Body).Decode(&deepseekResp); err != nil {
-		return "", fmt.Errorf("failed to decode response: %v", err)
+		return "", fmt.Errorf("decode failed: %w", err)
 	}
 
 	if len(deepseekResp.Choices) == 0 {
-		return "", fmt.Errorf("no choices in Deepseek response")
+		return "", fmt.Errorf("no choices in response")
 	}
 
 	return deepseekResp.Choices[0].Message.Content, nil
 }
 
-// postGitHubComment posts a review comment to the GitHub PR
 func postGitHubComment(wp WebhookPayload, comment string) error {
 	client := github.NewClient(nil).WithAuthToken(os.Getenv("GITHUB_TOKEN"))
-	reviewComment := &github.PullRequestComment{
-		Body: github.String(comment),
-	}
-
 	_, _, err := client.PullRequests.CreateComment(
 		context.Background(),
 		wp.Repository.Owner.Login,
 		wp.Repository.Name,
 		wp.PullRequest.Number,
-		reviewComment,
+		&github.PullRequestComment{Body: github.String(comment)},
 	)
 	return err
 }
